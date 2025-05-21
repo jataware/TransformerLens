@@ -36,55 +36,63 @@ def extract_choice(x):
     matches = re.findall(pattern, x)
     return matches[-1] if matches else None
 
-def strip_repeated_eos(text, eos_token):
+def strip_eos(text, eos_token):
     escaped_eos = re.escape(eos_token)
     pattern     = f"({escaped_eos})+$"
-    return re.sub(pattern, eos_token, text)
+    return re.sub(pattern, '', text)
+
+def n_tokens(x):
+    # does this handle special tokens correctly?
+    return len(model.tokenizer.encode(x))
+
+def first_n_tokens(x, n):
+    return model.tokenizer.decode(model.tokenizer.encode(x)[:n])
 
 # --
 # Fact generation
+# !! Could probably get better facts w/ gemini or something, though that may be 
 
-input = [
+fact_msgs = [
     {"role": "system", "content": "You are a helpful assistant.  Please follow all instructions very carefully."},
     {"role": "user",   "content": 'Output a short fact about a US state capitol.'}
 ]
 
-input_str   = model.tokenizer.apply_chat_template(input, tokenize=False, add_generation_prompt=True)
-output_toks = model.generate([input_str] * 128, max_new_tokens=128, top_k=generation_config.top_k, top_p=generation_config.top_p, temperature=generation_config.temperature, return_type='tokens')
+fact_prompt   = model.tokenizer.apply_chat_template(fact_msgs, tokenize=False, add_generation_prompt=True)
+fact_toks_out = model.generate([fact_prompt] * 512, max_new_tokens=128, top_k=generation_config.top_k, top_p=generation_config.top_p, temperature=generation_config.temperature, return_type='tokens')
 
-output = [model.tokenizer.decode(o, skip_special_tokens=False) for o in output_toks]
-output = [strip_repeated_eos(o, model.tokenizer.eos_token) for o in output]
-output = list(set(output)) # deduplicate
-
-output = [o.replace(input_str, '') for o in output]
-output = ['<|im_end|>'.join(o.split('<|im_end|>')[:-1]) for o in output]
-facts  = output
+fact_strs_out = [model.tokenizer.decode(xx, skip_special_tokens=False) for xx in fact_toks_out] # convert to string
+fact_strs_out = [xx.replace(fact_prompt, '') for xx in fact_strs_out] # strip prompt
+fact_strs_out = [strip_eos(o, model.tokenizer.eos_token) for o in fact_strs_out] # strip eos
+fact_strs_out = list(set(fact_strs_out)) # deduplicate
 
 # --
 # Heads / tails generation
 
-input = [
+choice_msgs = [
     {"role": "system", "content": "You are a helpful assistant.  Please follow all instructions very carefully."},
     {"role": "user",   "content": 'Output a short fact about a US state capitol. Then output one of "heads" or "tails" wrapped in <choice></choice> tags.'}
 ]
 
-input_str  = model.tokenizer.apply_chat_template(input, tokenize=False, add_generation_prompt=True)
-input_strs = [input_str + o + '\n <choice>' for o in facts]
+choice_prompt  = model.tokenizer.apply_chat_template(choice_msgs, tokenize=False, add_generation_prompt=True)
+choice_prompts = [choice_prompt + fact_str + '\n<choice>' for fact_str in fact_strs_out]
 
-logits      = model(input_strs)
-last_logits = logits[:,-1]
+logits = model(choice_prompts)[:, -1]
+probs  = logits.softmax(axis=-1)
 
-idxs        = model.tokenizer.encode(['heads', 'tails'])
-probs       = last_logits.softmax(axis=-1)[:,idxs]
+choice_idxs  = model.tokenizer.encode(['heads', 'tails'])
+choice_probs = probs[:,choice_idxs]
+p_heads      = to_np(choice_probs[:,0])
+ranks        = np.argsort(p_heads)
 
-_ = plt.plot(np.sort(to_np(probs[:,0])))
-_ = plt.xlabel('Rank')
-_ = plt.ylabel('Probability of heads')
+_ = plt.plot(np.sort(p_heads))
+_ = plt.xlabel('Prompt Rank')
+_ = plt.ylabel('Probability of "heads"')
+_ = plt.grid('both', c='grey', alpha=0.5)
 show_plot()
 
-ranks     = np.argsort(probs[:,0].cpu().numpy())
-output_lo = model.generate([input_strs[ranks[0]]] * 100, max_new_tokens=128, top_k=generation_config.top_k, top_p=generation_config.top_p, temperature=generation_config.temperature)
-output_hi = model.generate([input_strs[ranks[-1]]] * 100, max_new_tokens=128, top_k=generation_config.top_k, top_p=generation_config.top_p, temperature=generation_config.temperature)
+# sanity check ... this is obviously correct though
+output_lo = model.generate([choice_prompts[ranks[0]]] * 100, max_new_tokens=128, top_k=generation_config.top_k, top_p=generation_config.top_p, temperature=generation_config.temperature)
+output_hi = model.generate([choice_prompts[ranks[-1]]] * 100, max_new_tokens=128, top_k=generation_config.top_k, top_p=generation_config.top_p, temperature=generation_config.temperature)
 
 (np.array([extract_choice(o) for o in output_lo]) == 'heads').mean()
 # 0.1
@@ -93,31 +101,32 @@ output_hi = model.generate([input_strs[ranks[-1]]] * 100, max_new_tokens=128, to
 # 1.0
 
 # --
-# Get activations
+# Get activations from top / bottom n prompts
 
-n = 40
+n = 50
+padding_side = 'right'
 
-input_lo = [input_strs[i] for i in ranks[:n]]
-log_lo, act_lo = model.run_with_cache(input_lo, names_filter=lambda hook_name: 'resid_mid' in hook_name,)
-log_lo, act_lo = log_lo.to('cpu'), act_lo.to('cpu')
+input_lo  = [choice_prompts[i] for i in ranks[:n]]
+_, act_lo = model.run_with_cache(input_lo, padding_side=padding_side, names_filter=lambda hook_name: 'resid_mid' in hook_name,)
+act_lo    = act_lo.to('cpu')
 
-input_hi = [input_strs[i] for i in ranks[-n:]]
-log_hi, act_hi = model.run_with_cache(input_hi, names_filter=lambda hook_name: 'resid_mid' in hook_name)
-log_hi, act_hi = log_hi.to('cpu'), act_hi.to('cpu')
+input_hi  = [choice_prompts[i] for i in ranks[-n:]]
+_, act_hi = model.run_with_cache(input_hi, padding_side=padding_side, names_filter=lambda hook_name: 'resid_mid' in hook_name)
+act_hi    = act_hi.to('cpu')
 
 # --
 # Train classifier
 
-np.sort([len(model.tokenizer.encode(o)) for o in facts])
-
 layer_idx = -5
 layer_id  = list(act_lo.keys())[layer_idx]
+
+token_ids = list(range(n_tokens(choice_prompt), n_tokens(choice_prompt) + 10, 1))
 
 out = []
 for it in trange(32):
     idx_train, idx_valid = train_test_split(range(2 * n), test_size=0.2)
     
-    for token_idx in range(-1, -20, -1):
+    for token_idx in token_ids:
         X_hi = act_hi[layer_id][:,token_idx].numpy()
         X_lo = act_lo[layer_id][:,token_idx].numpy()
         
@@ -143,4 +152,102 @@ _ = plt.plot(df_out.groupby('token_idx').acc.mean(), label='mean', c='black')
 _ = plt.grid('both', c='grey', alpha=0.5)
 _ = plt.xlabel('token index')
 _ = plt.ylabel('ROC AUC')
+show_plot()
+
+# Upshot: can get pretty good classifier for outcome looking at the first ~5 tokens
+
+# --
+# What if we train a single classifier on all tokens?
+
+X_hi = act_hi[layer_id][:,n_tokens(choice_prompt)+3:n_tokens(choice_prompt)+13]
+X_lo = act_lo[layer_id][:,n_tokens(choice_prompt)+3:n_tokens(choice_prompt)+13]
+
+X_hi = X_hi / np.sqrt((X_hi ** 2).sum(axis=-1, keepdims=True))
+X_lo = X_lo / np.sqrt((X_lo ** 2).sum(axis=-1, keepdims=True))
+
+X_hi_train, X_hi_valid = train_test_split(X_hi, test_size=0.2)
+X_lo_train, X_lo_valid = train_test_split(X_lo, test_size=0.2)
+
+Z_hi_train = X_hi_train.reshape(-1, 3584)
+Z_hi_valid = X_hi_valid.reshape(-1, 3584)
+Z_lo_train = X_lo_train.reshape(-1, 3584)
+Z_lo_valid = X_lo_valid.reshape(-1, 3584)
+
+Z_train = np.concatenate([Z_hi_train, Z_lo_train], axis=0)
+Z_valid = np.concatenate([Z_hi_valid, Z_lo_valid], axis=0)
+
+y_train = np.concatenate([np.ones(len(Z_hi_train)), np.zeros(len(Z_lo_train))])
+y_valid = np.concatenate([np.ones(len(Z_hi_valid)), np.zeros(len(Z_lo_valid))])
+
+clf = LinearSVC(max_iter=10000).fit(Z_train, y_train)
+acc = metrics.roc_auc_score(y_valid, clf.decision_function(Z_valid))
+print(acc)
+# > .80 ... need more samples to really train
+
+
+scores_lo = clf.decision_function(X_lo_valid.reshape(-1, 3584)).reshape(len(X_lo_valid), -1)
+scores_hi = clf.decision_function(X_hi_valid.reshape(-1, 3584)).reshape(len(X_hi_valid), -1)
+
+# What if we apply the classifier rolling forward?
+for xx in scores_lo:
+    _ = plt.plot(xx, c='blue', alpha=0.25)
+
+for xx in scores_hi:
+    _ = plt.plot(xx, c='red', alpha=0.25)
+
+_ = plt.plot(scores_lo.mean(axis=0), c='blue')
+_ = plt.plot(scores_hi.mean(axis=0), c='red')
+
+show_plot()
+
+# --
+
+traj = []
+def my_hook(act, hook):
+    global traj
+    tmp = to_np(act[:,-1])
+    tmp = tmp / np.sqrt((tmp ** 2).sum(axis=-1, keepdims=True))
+    traj.append(clf.decision_function(tmp))
+    return act
+
+model.reset_hooks()
+model.add_hook(layer_id, my_hook)
+
+output = model.generate([choice_prompt] * 128, max_new_tokens=128, top_k=generation_config.top_k, top_p=generation_config.top_p, temperature=generation_config.temperature)
+traj   = np.row_stack(traj).T
+
+model.reset_hooks()
+tmp     = ['<choice>'.join(xx.split('<choice>')[:-1]) + '<choice>' for xx in output]
+_logits = model(tmp)[:, -1]
+_probs  = _logits.softmax(axis=-1)
+_choice_probs = _probs[:,choice_idxs]
+_p_heads      = to_np(_choice_probs[:,0])
+
+_ = plt.plot(np.sort(_p_heads))
+show_plot()
+
+
+plt.scatter(traj[:,10], _p_heads)
+show_plot()
+
+from scipy.stats import spearmanr
+spearmanr(traj[:,10], _p_heads)
+
+
+z = np.array([extract_choice(o) for o in output]) == 'heads'
+
+for xx, zz in zip(traj, z):
+    _ = plt.plot(xx[:20], c='red' if zz else 'blue', alpha=0.25)
+
+show_plot()
+
+_ = plt.plot([metrics.roc_auc_score(z, traj[:,i]) for i in range(traj.shape[1])])
+show_plot()
+
+_ = plt.plot(traj[z].mean(axis=0)[:20], c='red')
+_ = plt.plot(traj[~z].mean(axis=0)[:20], c='blue')
+show_plot()
+
+_ = plt.hist(traj[z,10], bins=100)
+_ = plt.hist(traj[~z,10], bins=100)
 show_plot()
