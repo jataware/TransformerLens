@@ -186,3 +186,17 @@
     strictListInference=true
     strictParameterNoneValue=true
     strictSetInference=true
+
+[tool.pixi.workspace]
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[tool.pixi.pypi-dependencies]
+transformer-lens = { path = ".", editable = true }
+
+[tool.pixi.tasks]
+
+[tool.pixi.dependencies]
+matplotlib = ">=3.10.6,<4"
+pip = ">=25.2,<26"
+seaborn = ">=0.13.2,<0.14"
