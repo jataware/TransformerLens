@@ -85,7 +85,8 @@ ins = InspectModel()
 
 inpaths = [
     Path(__here__) / 'data/seed_10016.jl',
-    # Path(__here__) / 'data/seed_10116.jl',
+    Path(__here__) / 'data/seed_10116.jl',
+    Path(__here__) / 'data/seed_10232.jl',
 ]
 
 data   = [json.loads(line) for inpath in inpaths for line in inpath.open('r').readlines()]
@@ -122,32 +123,34 @@ assert df.groupby('_qidx').target_str.apply(lambda x: 1 == len(set(x))).values.a
 # # --
 # # sanity checks
 
-# # does majority voting help?
-# # yes ... though not be a ton
-# df.correct.mean()
-# df.groupby('_qidx').apply(lambda x: Counter(x.answer_str).most_common(1)[0][0] == x.target_str.values[0]).mean()
+# does majority voting help?
+# yes ... though not be a ton
+df.correct.mean()
+df.groupby('_qidx').apply(lambda x: Counter(x.answer_str).most_common(1)[0][0] == x.target_str.values[0]).mean()
 
-# df["_maj"] = df.groupby('_qidx').answer_str.transform(lambda x: Counter(x).most_common(1)[0][0])
-# df["_n"]   = df.groupby('_qidx').answer_str.transform(lambda x: len(set(x)))
+# is consistency correlated with correctness?
+# yes
+df["_maj"] = df.groupby('_qidx').answer_str.transform(lambda x: Counter(x).most_common(1)[0][0])
+df["_n"]   = df.groupby('_qidx').answer_str.transform(lambda x: len(set(x)))
 
-# # is consistency correlated with correctness?
-# # yes
-# udf = df.drop_duplicates('_qidx')
-# pd.crosstab(udf._n, udf._maj == udf.target_str, normalize='index')
+udf = df.drop_duplicates('_qidx')
+pd.crosstab(udf._n, udf._maj == udf.target_str, normalize='index')
 
-# # [TODO] consistency is highly correlated with accuracy ...
+# [TODO] consistency is highly correlated with accuracy ...
 
-# df['c'] = df.answer_str == df._maj
+df['c'] = df.answer_str == df._maj
 
-
-# # <<
 # # pct of responses in majority class is also correlated with accuracy ... maybe this is better
 # # than just unique counts
-# a = df.groupby('_qidx').c.mean().values
-# b = df.groupby('_qidx').apply(lambda x: x._maj.values[0] == x.target_str.values[0]).values
-# z = pd.Series(b).groupby(a.round(2)).mean()
-# _ = plt.plot(z.index, z.values)
-# show_plot()
+a = df.groupby('_qidx').c.mean().values
+b = df.groupby('_qidx').apply(lambda x: x._maj.values[0] == x.target_str.values[0]).values
+z = pd.Series(b).groupby(a.round(1)).mean()
+_ = plt.plot(z.index, z.values)
+show_plot()
+
+pd.crosstab(a.round(1), b)
+pd.crosstab(a.round(1), b, normalize='index')
+
 # # but then the question is how to estimate "pct of responses in majority class" efficiently
 
 # # [TODO] demonstrate this is actually useful, w/ a large number of samples.  does it get
@@ -173,7 +176,7 @@ uanswer_str = sub.answer_str.unique()
 answer2idx  = {a: i for i, a in enumerate(uanswer_str)}
 y           = np.array([answer2idx[a] for a in sub.answer_str.values])
 
-assert len(set(y)) == 2
+assert len(set(y)) == 2 # [TODO] fix this
 
 # --
 # Compute activations
@@ -192,21 +195,21 @@ logits, activations = ins.forward(messages)
 prefix_tokens = ins.n_tokens(ins.prep(messages[0][:2]))
 output_tokens = [ins.n_tokens(ins.prep([message[-1]])) for message in messages]
 
-acts = activations['blocks.30.hook_resid_post'][:,prefix_tokens:].clone()
+acts = activations['blocks.25.hook_resid_post'][:,prefix_tokens:].clone()
 acts = acts.numpy()
 
-breakpoint()
+# breakpoint()
 
-# # <<
-from scipy.spatial.distance import pdist, squareform
-mean_acts = np.array([a[:int(t * 0.1)].mean(axis=0) for a, t in zip(acts, output_tokens)])
+# # # <<
+# from scipy.spatial.distance import pdist, squareform
+# mean_acts = np.array([a[:int(t * 0.1)].mean(axis=0) for a, t in zip(acts, output_tokens)])
 
-mean_acts = mean_acts[np.argsort(y)]
+# mean_acts = mean_acts[np.argsort(y)]
 
-dist      = squareform(pdist(np.sign(mean_acts) * np.sqrt(np.abs(mean_acts)), metric='cosine'))
-_         = heatmap(dist, cmap='viridis')
-show_plot()
-# # >>
+# dist      = squareform(pdist(np.sign(mean_acts) * np.sqrt(np.abs(mean_acts)), metric='cosine'))
+# _         = heatmap(dist, cmap='viridis')
+# show_plot()
+# # # >>
 
 
 # --
@@ -238,11 +241,16 @@ def run_one(acts, output_tokens, y, n_train=2, p=1):
     return roc_auc_score(y[valid_sel], y_hat), y_hat.sum(), y[valid_sel].sum()
 
 
-for n_train in range(1, 3):
-    for p in [0.25, 0.5, 0.75]:
-        tmp, a, b = zip(*[run_one(acts, output_tokens, y, n_train=n_train, p=p) for _ in range(64)])
-        print(n_train, p, np.mean(tmp), np.median(tmp), np.mean(a), np.mean(b))
-        _ = plt.plot(np.sort(tmp), label=f'{n_train} {p}')
+for layer in [20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30]:
+    acts = activations[f'blocks.{layer}.hook_resid_post'][:,prefix_tokens:].clone()
+    acts = acts.numpy()
+    
+    for n_train in [2]:
+        for p in [1]:
+            tmp, a, b = zip(*[run_one(acts, output_tokens, y, n_train=n_train, p=p) for _ in range(64)])
+            print(layer, n_train, p, np.mean(tmp), np.median(tmp), np.mean(a), np.mean(b))
+            _ = plt.plot(np.sort(tmp), label=f'{layer} {n_train} {p}')
+
 
 _ = plt.axhline(0.5, c='red')
 _ = plt.legend(loc='lower right')
