@@ -13,11 +13,16 @@ import numpy as np
 from seaborn import heatmap
 from torch.nn.functional import normalize
 
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.spatial.distance import pdist, squareform
+import math
+
 # --
 
 padding_side = 'left'
 
-model_str                    = "Qwen/Qwen3-8B"
+model_str                    = "microsoft/phi-4"
 model                        = transformer_lens.HookedTransformer.from_pretrained(model_str)
 model.tokenizer.padding_side = padding_side
 model.tokenizer.pad_token    = model.tokenizer.eos_token
@@ -58,13 +63,6 @@ logits, activations = model.run_with_cache(input_str, padding_side=padding_side,
 activations         = activations.to('cpu')
 logits              = logits.to('cpu')
 
-
-# min_tokens = min([n_tokens(s) for s in input_str])
-
-import pandas as pd
-import matplotlib.pyplot as plt
-from scipy.spatial.distance import pdist, squareform
-import math
 
 # cosine distance between average activations
 layer_keys = [k for k in activations.keys() if 'resid_post' in k]
