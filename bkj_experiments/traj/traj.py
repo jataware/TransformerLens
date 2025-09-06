@@ -18,6 +18,8 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 from rich import print as rprint
+from tqdm import trange
+from collections import Counter
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import train_test_split
 
@@ -44,18 +46,23 @@ class InspectModel:
     def prep(self, messages):
         return self.model.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
     
-    def forward(self, messages):
+    def forward(self, messages, chunk_size=16):
         self.model.reset_hooks()
         
-        logits, activations = self.model.run_with_cache(
-            self.prep(messages), 
-            padding_side = self.model.tokenizer.padding_side, 
-            names_filter = lambda hook_name: 'resid_post' in hook_name # Is this right?
-        )
-        logits              = logits.to('cpu')
-        activations         = activations.to('cpu')
+        all_logits      = []
+        all_activations = []
+        for offset in range(0, len(messages), chunk_size):
+            messages_chunk = messages[offset:offset+chunk_size]
+            logits, activations = self.model.run_with_cache(
+                self.prep(messages_chunk), 
+                padding_side = self.model.tokenizer.padding_side, 
+                names_filter = lambda hook_name: 'resid_post' in hook_name # Is this right?
+            )
+            all_logits.append(logits.to('cpu'))
+            all_activations.append(activations.to('cpu'))
         
-        return logits, activations
+        # breakpoint() # [TODO] get the batch to work
+        return all_logits, all_activations
 
 
 ins = InspectModel()
@@ -117,6 +124,30 @@ df["_n"]   = df.groupby('_qidx').answer_str.transform(lambda x: len(set(x)))
 udf = df.drop_duplicates('_qidx')
 pd.crosstab(udf._n, udf._maj == udf.target_str, normalize='index')
 
+# [TODO] consistency is highly correlated with accuracy ...
+
+df['c'] = df.answer_str == df._maj
+
+
+# <<
+# pct of responses in majority class is also correlated with accuracy ... maybe this is better
+# than just unique counts
+a = df.groupby('_qidx').c.mean().values
+b = df.groupby('_qidx').apply(lambda x: x._maj.values[0] == x.target_str.values[0]).values
+z = pd.Series(b).groupby(a.round(2)).mean()
+_ = plt.plot(z.index, z.values)
+show_plot()
+# but then the question is how to estimate "pct of responses in majority class" efficiently
+
+# [TODO] demonstrate this is actually useful, w/ a large number of samples.  does it get
+#        meaningfully better as you go from 8, 16, 32, ..., 128 samples?
+#        - confounder: temperature, ...
+# [IDEA] train a model to predict class from partial rollouts and then use that compute % majority
+#        class for confidence estimation
+# [IDEA] do some unsupervised thing on partial embeddings to get confidence estimates
+# >>
+
+
 # --
 # Pick a question
 
@@ -131,6 +162,10 @@ answer2idx  = {a: i for i, a in enumerate(uanswer_str)}
 y           = np.array([answer2idx[a] for a in sub.answer_str.values])
 
 assert len(set(y)) == 2
+
+# <<
+sub = sub.head(16)
+# >>
 
 # --
 # Compute activations
@@ -147,6 +182,12 @@ messages      = [
 logits, activations = ins.forward(messages)
 
 # <<
+# while working on batching
+logits = logits[0]
+activations = activations[0]
+# >>
+
+# <<
 # prefix_tokens = ins.n_tokens(ins.prep(messages[0][:2]))
 # --
 prefix_tokens = ins.n_tokens(ins.model.tokenizer.apply_chat_template(messages[0][:2], tokenize=False, add_generation_prompt=False))
@@ -156,17 +197,23 @@ output_tokens = [ins.n_tokens(ins.model.tokenizer.apply_chat_template([message[-
 acts = activations['blocks.30.hook_resid_post'][:,prefix_tokens:].clone()
 acts = acts.numpy()
 
+breakpoint()
+
+
+# <<
+mean_acts = np.array([a[:int(t * p)].mean(axis=0) for a, t in zip(acts, output_tokens)])
+dist      = squareform(pdist(mean_acts, metric='cosine'))
+_         = heatmap(dist, cmap='viridis')
+show_plot()
+# >>
+
+
 # --
 # Train model
+# This seems to be doing something ...
 
 from sklearn.svm import LinearSVC
 from sklearn.linear_model import LogisticRegression
-
-def rolling_mean(x, window):
-    out = pd.DataFrame(x).rolling(window=window).mean().values
-    out = out[~np.isnan(out).any(axis=1)]
-    return out
-
 
 def run_one(n_train=2, p=1):
     idx0 = np.where(y == 0)[0]
@@ -197,86 +244,8 @@ show_plot()
 
 
 
-def get_prefix(message, n_tokens):
-    toks = ins.model.tokenizer.apply_chat_template([message], tokenize=True, add_generation_prompt=False, max_length=n_tokens, truncation=True)
-    return ins.model.tokenizer.decode(toks)
+# def get_prefix(message, n_tokens):
+#     toks = ins.model.tokenizer.apply_chat_template([message], tokenize=True, add_generation_prompt=False, max_length=n_tokens, truncation=True)
+#     return ins.model.tokenizer.decode(toks)
 
-rprint([get_prefix(m[-1], 32) for m in messages])
-
-
-
-
-
-
-
-
-
-# # --
-# # IO
-
-# traces   = [json.loads(line) for line in open('trace.jl')]
-# messages = [
-#     [
-#         {"role": "system",    "content": "You are a helpful assistant."},
-#         {"role": "user",      "content": trace['prompt']},
-#         {"role": "assistant", "content": trace['output_str']}
-#     ]
-#     for trace in traces
-# ]
-
-
-
-
-# from sklearn.linear_model import LogisticRegression
-
-# pre_tokens = n_tokens(model.tokenizer.apply_chat_template(messages[0][:2], tokenize=False, add_generation_prompt=False))
-# token_cnts = [n_tokens(s) for s in input_str]
-
-# a = activations['blocks.30.hook_resid_post']
-# a = a.numpy().copy()
-# f = np.vstack([aa[pre_tokens:cc].mean(axis=0) for aa, cc in zip(a, token_cnts)])
-
-# lr = LogisticRegression().fit([f[3], f[2]], [0, 1])
-
-# tmp = []
-# for i in range(1, max(token_cnts)):
-#     fp = np.vstack([aa[:i].mean(axis=0) for aa, cc in zip(a, token_cnts)])
-#     tmp.append(lr.predict_proba(fp)[:,1])
-
-# tmp = np.array(tmp)
-# for i, t in enumerate(tmp.T):
-#     plt.plot(t[:token_cnts[i]], label=f'{i}')
-
-# _ = plt.legend()
-# show_plot()
-
-# # for k in activations.keys():
-# #     print(k, activations[k].shape)
-
-# min_tokens = min([n_tokens(s) for s in input_str])
-
-
-
-# a = activations['blocks.30.hook_resid_post'].clone()
-# a = a[:, pre_tokens:min_tokens]
-
-# f = a[:, -1].mean(axis=1)
-# d = squareform(pdist(f, metric='cosine'))
-# d.round(2) * 100
-
-
-# a  = a.numpy()
-# an = a
-# # an = np.array([pd.DataFrame(x).rolling(window=32).mean().values for x in a])
-# an = an / np.sqrt((an ** 2).sum(axis=-1, keepdims=True))
-
-# labs = [0, 1, 1, 0]
-# for i in range(an.shape[0]):
-#     for j in range(i + 1, an.shape[0]):
-#         c = 'red' if labs[i] == labs[j] else 'black'
-#         _ = plt.plot(, label=f'{i} vs {j}', c=c)
-
-# _ = plt.legend()
-# show_plot()
-
-
+# rprint([get_prefix(m[-1], 32) for m in messages])
