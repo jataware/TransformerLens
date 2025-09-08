@@ -1,4 +1,5 @@
 import numpy as np
+from tqdm import tqdm
 from rich import print as rprint
 
 import transformer_lens
@@ -20,7 +21,7 @@ class InspectModel:
     def prep(self, messages):
         return self.model.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
     
-    def forward(self, messages):
+    def forward(self, messages, **kwargs):
         n_messages = len(messages)
         inputs_str = self.prep(messages)
         n_tokens   = self.n_tokens(inputs_str)
@@ -29,14 +30,18 @@ class InspectModel:
         logits, activations = self.model.run_with_cache(
             inputs_str, 
             padding_side        = self.model.tokenizer.padding_side, 
-            names_filter        = lambda hook_name: 'resid' in hook_name,
-            return_cache_object = False
+            return_cache_object = False,
+            **kwargs
         )
         
         _cache = {
             **{k:v.to('cpu') for k, v in activations.items()},
             "logits": logits.to('cpu'),
         }
+        
+        del logits
+        del activations
+        # [???] garbage collection?
         
         out = []
         for i in range(n_messages):
@@ -49,7 +54,7 @@ class InspectModel:
         
         return out
     
-    def batched_forward(self, messages, tokens_per_batch=1024):
+    def batched_forward(self, messages, tokens_per_batch=1024, **kwargs):
         inputs_str = self.prep(messages)
         n_tokens   = self.n_tokens(inputs_str)
         assert max(n_tokens) <= tokens_per_batch, "Max token count per batch is less than the max token count per message"
@@ -69,7 +74,7 @@ class InspectModel:
         for i, (msg, tokens) in enumerate(zip(sorted_messages, sorted_n_tokens)):
             if curr_n_toks + tokens > tokens_per_batch and curr_batch:
                 batches.append(curr_batch)
-                print(f'\tbatch={curr_batch} | n_tokens={curr_n_toks}')
+                print(f' batch_idx={len(batches) - 1:03d} | tokens={curr_n_toks:04d} | batch={curr_batch}')
                 curr_batch  = []
                 curr_n_toks = 0
             
@@ -78,17 +83,15 @@ class InspectModel:
         
         if curr_batch:
             batches.append(curr_batch)
-            print(f'\tbatch={curr_batch} | n_tokens={curr_n_toks}')
+            print(f' batch_idx={len(batches) - 1:03d} | tokens={curr_n_toks:04d} | batch={curr_batch}')
             
         # --
         # Run
         
         all_results = [None] * len(messages)
-        for batch_indices in batches:
-            batch_messages = [sorted_messages[i] for i in batch_indices]
-            batch_results  = self.forward(batch_messages)
-            
-            for batch_idx, result in zip(batch_indices, batch_results):
+        for batch_idxs in tqdm(batches):
+            batch_results = self.forward([sorted_messages[i] for i in batch_idxs], **kwargs)
+            for batch_idx, result in zip(batch_idxs, batch_results):
                 all_results[asort[batch_idx]] = result
         
         return all_results

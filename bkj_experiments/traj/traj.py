@@ -118,17 +118,18 @@ pd.crosstab(a.round(1), b, normalize='index')
 # --
 # Pick a question
 
-acc  = df.groupby('_qidx').correct.mean()
-acc  = acc[(acc > 0.4) & (acc < 0.6)]
-qidx = acc.index[3]
+n_answers = df.groupby('_qidx').answer_str.apply(lambda x: len(set(x)))
+keep      = n_answers.index[n_answers.values == 2]
 
-sub  = df[df['_qidx'] == qidx]
+sub       = df[df._qidx.isin(keep)].groupby('_qidx').correct.mean()
+sub       = sub[(sub > 0.4) & (sub < 0.6)]
 
+qidx      = sub.index[3]
+sub       = df[df['_qidx'] == qidx]
 
 uanswer_str = sub.answer_str.unique()
 answer2idx  = {a: i for i, a in enumerate(uanswer_str)}
 y           = np.array([answer2idx[a] for a in sub.answer_str.values])
-
 assert len(set(y)) == 2 # [TODO] fix this
 
 # --
@@ -143,7 +144,14 @@ messages      = [
     ] for prompt, output_str in sub[['prompt', 'output_str']].values
 ]
 
-logits, activations = ins.forward(messages)
+def _layer_filter(layer_name):
+    if 'resid_post' not in layer_name:
+        return False
+    
+    return True
+    
+cache = ins.batched_forward(messages, tokens_per_batch=8192, names_filter=_layer_filter)
+breakpoint()
 
 prefix_tokens = ins.n_tokens(ins.prep(messages[0][:2]))
 output_tokens = [ins.n_tokens(ins.prep([message[-1]])) for message in messages]
