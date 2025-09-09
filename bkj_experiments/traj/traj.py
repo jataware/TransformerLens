@@ -240,7 +240,7 @@ def run_one(seed, acts, output_tokens, y, n_train=2, p_toks=None, n_toks=None, e
 ptype = 'n_toks'
 
 jobs = []
-n_replicates = 16
+n_replicates = 64
 for layer in [30]:
     acts = [c[f'blocks.{layer}.hook_resid_post'][:,prefix_tokens:] for c in cache]
     acts = [a.clone().numpy() for a in acts]
@@ -280,14 +280,14 @@ for i, layer in enumerate(layers):
     layer_data = tab[tab['layer'] == layer]
     
     # Plot one line per n_train value
-    for n_train in sorted(layer_data['n_train'].unique()):
+    for cidx, n_train in enumerate(sorted(layer_data['n_train'].unique())):
         n_train_data = layer_data[layer_data['n_train'] == n_train]
         
         _ = ax.plot(n_train_data[ptype], n_train_data['roc_auc'], 
-                marker='o', label=f'n_train={n_train}', c=n_train)
+                marker='o', label=f'n_train={n_train}', c=f'C{cidx}')
     
         _ = ax.plot(n_train_data[ptype], n_train_data['roc_auc2'], 
-                marker='+', label=f'n_train={n_train} (SVM)', c=n_train)
+                marker='+', label=f'n_train={n_train} (SVM)', c=f'C{cidx}')
     
     _ = ax.set_xlabel(ptype)
     _ = ax.set_ylabel('ROC AUC')
