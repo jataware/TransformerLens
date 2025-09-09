@@ -133,6 +133,8 @@ answer2idx  = {a: i for i, a in enumerate(uanswer_str)}
 y           = np.array([answer2idx[a] for a in sub.answer_str.values])
 assert len(set(y)) == 2 # [TODO] fix this
 
+breakpoint()
+
 # --
 # Compute activations
 
@@ -162,8 +164,6 @@ cache         = ins.batched_forward(messages, tokens_per_batch=8192, names_filte
 prefix_tokens = ins.n_tokens(ins.prep(messages[0][:2]))
 output_tokens = [ins.n_tokens(ins.prep([message[-1]])) for message in messages]
 
-for c in cache:
-    print({k: v.shape for k, v in c.items()})
 
 # drop prefix
 cache = [
@@ -171,32 +171,16 @@ cache = [
     for c in cache
 ]
 
-for c in cache:
-    print({k: v.shape for k, v in c.items()})
-
-# close, though we're missing a few tokens
-# np.column_stack([
-#     [cache[i]['blocks.25.hook_resid_post'].shape[0] - prefix_tokens for i in range(len(cache))],
-#     output_tokens
-# ])
-
 # --
 # Train model
 # This seems to be doing something ...
 
-# [TODO] use multiple layers
-# [TODO] use different aggregations
-# [TODO] preprocessing - there are maybe weird spikes here? clipping? normalizing?
-
 from tqdm import trange
 from sklearn.svm import LinearSVC
 from sklearn.linear_model import LogisticRegression
-from sklearn.feature_extraction.text import TfidfVectorizer
 from joblib import Parallel, delayed
 
-
-toks = [ins.model.tokenizer.encode(ins.prep(m)) for m in messages]
-
+# toks = [ins.model.tokenizer.encode(ins.prep(m)) for m in messages]
 # X = TfidfVectorizer().fit_transform([' '.join([str(xxx) for xxx in xx]) for xx in toks])
 
 def run_one(seed, acts, output_tokens, y, n_train=2, p_toks=None, n_toks=None, extra=None):
@@ -214,26 +198,19 @@ def run_one(seed, acts, output_tokens, y, n_train=2, p_toks=None, n_toks=None, e
     valid_sel = ~train_sel
     
     if n_toks is not None:
-        mean_acts = np.array([a[:n_toks].mean(axis=0) for a, t in zip(acts, output_tokens)])
-        X         = TfidfVectorizer().fit_transform([' '.join([str(xxx) for xxx in xx[:n_toks]]) for xx in toks])
+        mean_acts = np.array([a[:n_toks].mean(axis=0) for a in acts])
     elif p_toks is not None:
         mean_acts = np.array([a[:int(t * p_toks)].mean(axis=0) for a, t in zip(acts, output_tokens)])
-        X         = TfidfVectorizer().fit_transform([' '.join([str(xxx) for xxx in xx[:int(t * p_toks)]]) for xx in toks])
     
     clf   = LogisticRegression(max_iter=10000, random_state=seed)
     clf   = clf.fit(mean_acts[train_sel], y[train_sel])
     y_hat = clf.predict_proba(mean_acts[valid_sel])[:,1]
-    
-    clf2   = LinearSVC(max_iter=10000, random_state=seed)
-    clf2   = clf2.fit(X[train_sel], y[train_sel])
-    y_hat2 = clf2.decision_function(X[valid_sel])
     
     return {
         "n_train" : n_train,
         "p_toks"  : p_toks,
         "n_toks"  : n_toks,
         "roc_auc" : roc_auc_score(y[valid_sel], y_hat),
-        "roc_auc2": roc_auc_score(y[valid_sel], y_hat2),
         **extra
     }
 
@@ -259,13 +236,11 @@ for layer in [30]:
                 for _ in range(n_replicates)
             ]
 
-
-
 res    = Parallel(n_jobs=-1, verbose=-1)(jobs)
 df_res = pd.DataFrame(res)
 
 # Create a table with mean ROC AUC scores
-tab = df_res.groupby(['n_train', ptype, 'layer'])[['roc_auc', 'roc_auc2']].mean().reset_index()
+tab = df_res.groupby(['n_train', ptype, 'layer'])[['roc_auc']].mean().reset_index()
 # Create grid of plots - one per layer
 
 layers = sorted(tab['layer'].unique())
@@ -285,10 +260,7 @@ for i, layer in enumerate(layers):
         
         _ = ax.plot(n_train_data[ptype], n_train_data['roc_auc'], 
                 marker='o', label=f'n_train={n_train}', c=f'C{cidx}')
-    
-        _ = ax.plot(n_train_data[ptype], n_train_data['roc_auc2'], 
-                marker='+', label=f'n_train={n_train} (SVM)', c=f'C{cidx}')
-    
+        
     _ = ax.set_xlabel(ptype)
     _ = ax.set_ylabel('ROC AUC')
     _ = ax.set_title(f'Layer {layer}')
