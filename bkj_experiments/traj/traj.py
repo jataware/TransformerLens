@@ -13,6 +13,7 @@ from matplotlib import pyplot as plt
 from rcode import *
 from seaborn import heatmap
 
+import re
 import json
 import numpy as np
 import pandas as pd
@@ -31,7 +32,7 @@ from inspect_model import InspectModel
 
 __here__ = Path(__file__).parent
 
-ins = InspectModel()
+ins = InspectModel(padding_side='right')
 
 # --
 # IO
@@ -122,9 +123,9 @@ n_answers = df.groupby('_qidx').answer_str.apply(lambda x: len(set(x)))
 keep      = n_answers.index[n_answers.values == 2]
 
 sub       = df[df._qidx.isin(keep)].groupby('_qidx').correct.mean()
-sub       = sub[(sub > 0.4) & (sub < 0.6)]
+sub       = sub[(sub > 0.25) & (sub < 0.75)]
 
-qidx      = sub.index[3]
+qidx      = sub.index[4]
 sub       = df[df['_qidx'] == qidx]
 
 uanswer_str = sub.answer_str.unique()
@@ -145,33 +146,39 @@ messages      = [
 ]
 
 def _layer_filter(layer_name):
-    if 'resid_post' not in layer_name:
-        return False
+    pattern = re.compile(r'blocks\.(\d+)\.hook_resid_post')
+    match   = pattern.match(layer_name)
+    if match:
+        return int(match.group(1)) >= 25
     
-    return True
-    
-cache = ins.batched_forward(messages, tokens_per_batch=8192, names_filter=_layer_filter)
-breakpoint()
+    return False
 
+try:
+    del cache
+except:
+    pass
+
+cache         = ins.batched_forward(messages, tokens_per_batch=8192, names_filter=_layer_filter)
 prefix_tokens = ins.n_tokens(ins.prep(messages[0][:2]))
 output_tokens = [ins.n_tokens(ins.prep([message[-1]])) for message in messages]
 
-acts = activations['blocks.25.hook_resid_post'][:,prefix_tokens:].clone()
-acts = acts.numpy()
+for c in cache:
+    print({k: v.shape for k, v in c.items()})
 
-# breakpoint()
+# drop prefix
+cache = [
+    {k: v[prefix_tokens:] for k, v in c.items()}
+    for c in cache
+]
 
-# # # <<
-# from scipy.spatial.distance import pdist, squareform
-# mean_acts = np.array([a[:int(t * 0.1)].mean(axis=0) for a, t in zip(acts, output_tokens)])
+for c in cache:
+    print({k: v.shape for k, v in c.items()})
 
-# mean_acts = mean_acts[np.argsort(y)]
-
-# dist      = squareform(pdist(np.sign(mean_acts) * np.sqrt(np.abs(mean_acts)), metric='cosine'))
-# _         = heatmap(dist, cmap='viridis')
-# show_plot()
-# # # >>
-
+# close, though we're missing a few tokens
+# np.column_stack([
+#     [cache[i]['blocks.25.hook_resid_post'].shape[0] - prefix_tokens for i in range(len(cache))],
+#     output_tokens
+# ])
 
 # --
 # Train model
@@ -184,45 +191,110 @@ acts = acts.numpy()
 from tqdm import trange
 from sklearn.svm import LinearSVC
 from sklearn.linear_model import LogisticRegression
+from sklearn.feature_extraction.text import TfidfVectorizer
+from joblib import Parallel, delayed
 
-def run_one(acts, output_tokens, y, n_train=2, p=1):
+
+toks = [ins.model.tokenizer.encode(ins.prep(m)) for m in messages]
+
+# X = TfidfVectorizer().fit_transform([' '.join([str(xxx) for xxx in xx]) for xx in toks])
+
+def run_one(seed, acts, output_tokens, y, n_train=2, p_toks=None, n_toks=None, extra=None):
+    if extra is None:
+        extra = {}
+    
+    rng = np.random.RandomState(seed)
+    assert p_toks is not None or n_toks is not None
+    
     idx0 = np.where(y == 0)[0]
     idx1 = np.where(y == 1)[0]
     
-    sel       = np.hstack([np.random.choice(idx0, n_train, replace=False), np.random.choice(idx1, n_train, replace=False)])
+    sel       = np.hstack([rng.choice(idx0, n_train , replace=False), rng.choice(idx1, n_train, replace=False)])
     train_sel = np.isin(np.arange(len(y)), sel)
     valid_sel = ~train_sel
     
-    mean_acts = np.array([a[:int(t * p)].mean(axis=0) for a, t in zip(acts, output_tokens)])
-    # mean_acts = mean_acts - mean_acts.mean(axis=0)
-    # mean_acts = mean_acts / np.std(mean_acts, axis=0)
+    if n_toks is not None:
+        mean_acts = np.array([a[:n_toks].mean(axis=0) for a, t in zip(acts, output_tokens)])
+        X         = TfidfVectorizer().fit_transform([' '.join([str(xxx) for xxx in xx[:n_toks]]) for xx in toks])
+    elif p_toks is not None:
+        mean_acts = np.array([a[:int(t * p_toks)].mean(axis=0) for a, t in zip(acts, output_tokens)])
+        X         = TfidfVectorizer().fit_transform([' '.join([str(xxx) for xxx in xx[:int(t * p_toks)]]) for xx in toks])
     
-    clf   = LogisticRegression(max_iter=10000).fit(mean_acts[train_sel], y[train_sel])
+    clf   = LogisticRegression(max_iter=10000, random_state=seed)
+    clf   = clf.fit(mean_acts[train_sel], y[train_sel])
     y_hat = clf.predict_proba(mean_acts[valid_sel])[:,1]
-    return roc_auc_score(y[valid_sel], y_hat), y_hat.sum(), y[valid_sel].sum()
-
-
-for layer in [20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30]:
-    acts = activations[f'blocks.{layer}.hook_resid_post'][:,prefix_tokens:].clone()
-    acts = acts.numpy()
     
-    for n_train in [2]:
-        for p in [1]:
-            tmp, a, b = zip(*[run_one(acts, output_tokens, y, n_train=n_train, p=p) for _ in range(64)])
-            print(layer, n_train, p, np.mean(tmp), np.median(tmp), np.mean(a), np.mean(b))
-            _ = plt.plot(np.sort(tmp), label=f'{layer} {n_train} {p}')
+    clf2   = LinearSVC(max_iter=10000, random_state=seed)
+    clf2   = clf2.fit(X[train_sel], y[train_sel])
+    y_hat2 = clf2.decision_function(X[valid_sel])
+    
+    return {
+        "n_train" : n_train,
+        "p_toks"  : p_toks,
+        "n_toks"  : n_toks,
+        "roc_auc" : roc_auc_score(y[valid_sel], y_hat),
+        "roc_auc2": roc_auc_score(y[valid_sel], y_hat2),
+        **extra
+    }
+
+ptype = 'n_toks'
+
+jobs = []
+n_replicates = 16
+for layer in [30]:
+    acts = [c[f'blocks.{layer}.hook_resid_post'][:,prefix_tokens:] for c in cache]
+    acts = [a.clone().numpy() for a in acts]
+    
+    for n_train in [2, 4, 8, 16]:
+        # for psize in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1]:
+        for psize in [50, 100, 150, 200, 250, 300, 350, 400, 450, 500]:
+            run_kwargs = {
+                "n_train" : n_train,
+                ptype     : psize,
+                "extra"   : {"layer": layer}
+            }
+            
+            jobs += [
+                delayed(run_one)(_,acts, output_tokens, y, **run_kwargs)
+                for _ in range(n_replicates)
+            ]
 
 
-_ = plt.axhline(0.5, c='red')
-_ = plt.legend(loc='lower right')
-show_plot()
 
+res    = Parallel(n_jobs=-1, verbose=-1)(jobs)
+df_res = pd.DataFrame(res)
 
+# Create a table with mean ROC AUC scores
+tab = df_res.groupby(['n_train', ptype, 'layer'])[['roc_auc', 'roc_auc2']].mean().reset_index()
+# Create grid of plots - one per layer
 
+layers = sorted(tab['layer'].unique())
+fig, axes = plt.subplots(1, len(layers), figsize=(7.5 * len(layers), 5))
 
+# Calculate global y-axis limits
+y_min = 0
+y_max = 1
 
-# def get_prefix(message, n_tokens):
-#     toks = ins.model.tokenizer.apply_chat_template([message], tokenize=True, add_generation_prompt=False, max_length=n_tokens, truncation=True)
-#     return ins.model.tokenizer.decode(toks)
+for i, layer in enumerate(layers):
+    ax = axes[i] if len(layers) > 1 else axes
+    layer_data = tab[tab['layer'] == layer]
+    
+    # Plot one line per n_train value
+    for n_train in sorted(layer_data['n_train'].unique()):
+        n_train_data = layer_data[layer_data['n_train'] == n_train]
+        
+        _ = ax.plot(n_train_data[ptype], n_train_data['roc_auc'], 
+                marker='o', label=f'n_train={n_train}', c=n_train)
+    
+        _ = ax.plot(n_train_data[ptype], n_train_data['roc_auc2'], 
+                marker='+', label=f'n_train={n_train} (SVM)', c=n_train)
+    
+    _ = ax.set_xlabel(ptype)
+    _ = ax.set_ylabel('ROC AUC')
+    _ = ax.set_title(f'Layer {layer}')
+    _ = ax.legend()
+    _ = ax.grid(True, alpha=0.3)
+    _ = ax.set_ylim(y_min, y_max)
 
-# rprint([get_prefix(m[-1], 32) for m in messages])
+_ = plt.tight_layout()
+_ = plt.savefig('roc_auc.png')

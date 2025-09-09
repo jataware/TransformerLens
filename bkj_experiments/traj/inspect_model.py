@@ -71,7 +71,7 @@ class InspectModel:
         batches     = []
         curr_batch  = []
         curr_n_toks = 0
-        for i, (msg, tokens) in enumerate(zip(sorted_messages, sorted_n_tokens)):
+        for i, tokens in enumerate(sorted_n_tokens):
             if curr_n_toks + tokens > tokens_per_batch and curr_batch:
                 batches.append(curr_batch)
                 print(f' batch_idx={len(batches) - 1:03d} | tokens={curr_n_toks:04d} | batch={curr_batch}')
